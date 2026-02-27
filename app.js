@@ -369,10 +369,19 @@ let jarvisMessages = [];
 let jarvisStreaming = false;
 let jarvisSessionId = null;
 
+function getJarvisUserIdentity() {
+  // Pass the logged-in user's email so Jarvis knows WHO is talking
+  if (currentUser && currentUser.email) return currentUser.email;
+  return 'unknown-user';
+}
+
 function getJarvisSessionId() {
+  const email = getJarvisUserIdentity();
+  // Session ID includes the user's email so each user gets their own session
+  const key = 'jarvis_session_' + email;
   if (jarvisSessionId) return jarvisSessionId;
-  let stored = localStorage.getItem('jarvis_session_id');
-  if (!stored) { stored = 'brain-' + crypto.randomUUID(); localStorage.setItem('jarvis_session_id', stored); }
+  let stored = localStorage.getItem(key);
+  if (!stored) { stored = 'brain:' + email + ':' + crypto.randomUUID(); localStorage.setItem(key, stored); }
   jarvisSessionId = stored;
   return stored;
 }
@@ -389,8 +398,9 @@ function toggleJarvisChat() {
 
 function clearJarvisChat() {
   jarvisMessages = [];
+  const email = getJarvisUserIdentity();
   jarvisSessionId = null;
-  localStorage.removeItem('jarvis_session_id');
+  localStorage.removeItem('jarvis_session_' + email);
   const container = document.getElementById('jarvisMessages');
   container.innerHTML = '<div class="jarvis-msg jarvis-msg-ai"><div class="jarvis-msg-bubble">Fresh start. What do you need?</div></div>';
 }
@@ -456,8 +466,10 @@ async function sendJarvisMessage() {
   // Show typing
   addJarvisTyping();
 
-  // Build messages array for API
-  const apiMessages = jarvisMessages.map(m => ({ role: m.role, content: m.content }));
+  // Build messages array for API - inject identity context
+  const userEmail = getJarvisUserIdentity();
+  const identityMsg = { role: 'system', content: `[Brain Chat] Logged-in user: ${userEmail}. Apply access control rules from SOUL.md accordingly.` };
+  const apiMessages = [identityMsg, ...jarvisMessages.map(m => ({ role: m.role, content: m.content }))];
 
   try {
     const response = await fetch(JARVIS_API, {
