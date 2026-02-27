@@ -362,26 +362,23 @@ function showToast(msg,isError) {
 checkSession();
 
 // ===================== JARVIS CHAT WIDGET =====================
-const JARVIS_API = 'https://myclaw.ai/v1/chat/completions';
-const JARVIS_TOKEN = '00814c53f0496287fe7798bf684e8516fa065ad865378c00f0ed3b2561419ef9';
 let jarvisChatOpen = false;
 let jarvisMessages = [];
 let jarvisStreaming = false;
 let jarvisSessionId = null;
+let jarvisRealtimeSub = null;
 
-function getJarvisUserIdentity() {
-  // Pass the logged-in user's email so Jarvis knows WHO is talking
+function getJarvisUserEmail() {
   if (currentUser && currentUser.email) return currentUser.email;
   return 'unknown-user';
 }
 
 function getJarvisSessionId() {
-  const email = getJarvisUserIdentity();
-  // Session ID includes the user's email so each user gets their own session
+  const email = getJarvisUserEmail();
   const key = 'jarvis_session_' + email;
   if (jarvisSessionId) return jarvisSessionId;
   let stored = localStorage.getItem(key);
-  if (!stored) { stored = 'brain:' + email + ':' + crypto.randomUUID(); localStorage.setItem(key, stored); }
+  if (!stored) { stored = 'brain:' + email + ':' + Date.now(); localStorage.setItem(key, stored); }
   jarvisSessionId = stored;
   return stored;
 }
@@ -393,16 +390,50 @@ function toggleJarvisChat() {
   if (jarvisChatOpen) {
     setTimeout(() => document.getElementById('jarvisInput').focus(), 300);
     scrollJarvisToBottom();
+    subscribeJarvisRealtime();
+    loadJarvisChatHistory();
   }
 }
 
 function clearJarvisChat() {
   jarvisMessages = [];
-  const email = getJarvisUserIdentity();
+  const email = getJarvisUserEmail();
   jarvisSessionId = null;
   localStorage.removeItem('jarvis_session_' + email);
   const container = document.getElementById('jarvisMessages');
   container.innerHTML = '<div class="jarvis-msg jarvis-msg-ai"><div class="jarvis-msg-bubble">Fresh start. What do you need?</div></div>';
+}
+
+async function loadJarvisChatHistory() {
+  const sid = getJarvisSessionId();
+  const { data } = await sb.from('jarvis_chat').select('*').eq('session_id', sid).order('created_at', { ascending: true }).limit(50);
+  if (!data || data.length === 0) return;
+  const container = document.getElementById('jarvisMessages');
+  container.innerHTML = '';
+  jarvisMessages = [];
+  for (const msg of data) {
+    jarvisMessages.push({ role: msg.role, content: msg.content });
+    addJarvisMessage(msg.role, msg.content);
+  }
+  scrollJarvisToBottom();
+}
+
+function subscribeJarvisRealtime() {
+  if (jarvisRealtimeSub) return;
+  const sid = getJarvisSessionId();
+  jarvisRealtimeSub = sb.channel('jarvis-chat-' + sid)
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'jarvis_chat', filter: 'session_id=eq.' + sid }, (payload) => {
+      const msg = payload.new;
+      if (msg.role === 'assistant') {
+        removeJarvisTyping();
+        jarvisMessages.push({ role: 'assistant', content: msg.content });
+        addJarvisMessage('assistant', msg.content);
+        jarvisStreaming = false;
+        document.getElementById('jarvisSendBtn').disabled = false;
+        document.getElementById('jarvisInput').focus();
+      }
+    })
+    .subscribe();
 }
 
 function addJarvisMessage(role, content) {
@@ -459,109 +490,45 @@ async function sendJarvisMessage() {
   jarvisStreaming = true;
   document.getElementById('jarvisSendBtn').disabled = true;
 
-  // Add user message
+  const email = getJarvisUserEmail();
+  const sid = getJarvisSessionId();
+
+  // Add user message to UI
   jarvisMessages.push({ role: 'user', content: text });
   addJarvisMessage('user', text);
-
-  // Show typing
   addJarvisTyping();
 
-  // Build messages array for API - inject identity context
-  const userEmail = getJarvisUserIdentity();
-  const identityMsg = { role: 'system', content: `[Brain Chat] Logged-in user: ${userEmail}. Apply access control rules from SOUL.md accordingly.` };
-  const apiMessages = [identityMsg, ...jarvisMessages.map(m => ({ role: m.role, content: m.content }))];
+  // Write to Supabase - Jarvis will pick it up
+  const { error } = await sb.from('jarvis_chat').insert({
+    session_id: sid,
+    user_email: email,
+    role: 'user',
+    content: text
+  });
 
-  try {
-    const response = await fetch(JARVIS_API, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${JARVIS_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'openclaw:main',
-        messages: apiMessages,
-        stream: true,
-        user: getJarvisSessionId()
-      })
-    });
-
-    if (!response.ok) {
-      removeJarvisTyping();
-      addJarvisMessage('assistant', 'Connection error. Try again.');
-      jarvisStreaming = false;
-      document.getElementById('jarvisSendBtn').disabled = false;
-      return;
-    }
-
-    // Remove typing indicator and create streaming bubble
+  if (error) {
     removeJarvisTyping();
-    const bubble = addJarvisMessage('assistant', '');
-    let fullText = '';
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        const data = trimmed.slice(6);
-        if (data === '[DONE]') continue;
-
-        try {
-          const parsed = JSON.parse(data);
-          const delta = parsed.choices?.[0]?.delta?.content;
-          if (delta) {
-            fullText += delta;
-            bubble.textContent = fullText;
-            scrollJarvisToBottom();
-          }
-        } catch (e) { /* skip malformed chunks */ }
-      }
-    }
-
-    // If we got no text from streaming, try non-streaming fallback
-    if (!fullText) {
-      try {
-        const fallback = await fetch(JARVIS_API, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${JARVIS_TOKEN}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            model: 'openclaw:main',
-            messages: apiMessages,
-            stream: false,
-            user: getJarvisSessionId()
-          })
-        });
-        const fbData = await fallback.json();
-        fullText = fbData.choices?.[0]?.message?.content || 'No response.';
-        bubble.textContent = fullText;
-      } catch (e) {
-        fullText = 'Connection error.';
-        bubble.textContent = fullText;
-      }
-    }
-
-    jarvisMessages.push({ role: 'assistant', content: fullText });
-
-  } catch (error) {
-    removeJarvisTyping();
-    addJarvisMessage('assistant', 'Connection failed. Try again in a moment.');
+    addJarvisMessage('assistant', 'Failed to send. Try again.');
+    jarvisStreaming = false;
+    document.getElementById('jarvisSendBtn').disabled = false;
+    return;
   }
 
-  jarvisStreaming = false;
-  document.getElementById('jarvisSendBtn').disabled = false;
-  document.getElementById('jarvisInput').focus();
+  // Fallback: if no response via realtime within 60s, poll
+  setTimeout(async () => {
+    if (jarvisStreaming) {
+      const { data } = await sb.from('jarvis_chat').select('*').eq('session_id', sid).eq('role', 'assistant').order('created_at', { ascending: false }).limit(1);
+      if (data && data.length > 0) {
+        const latest = data[0];
+        const lastUserMsg = jarvisMessages.filter(m => m.role === 'user').pop();
+        if (latest.created_at > new Date(Date.now() - 65000).toISOString()) {
+          removeJarvisTyping();
+          jarvisMessages.push({ role: 'assistant', content: latest.content });
+          addJarvisMessage('assistant', latest.content);
+          jarvisStreaming = false;
+          document.getElementById('jarvisSendBtn').disabled = false;
+        }
+      }
+    }
+  }, 60000);
 }
