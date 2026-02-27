@@ -360,3 +360,196 @@ function showToast(msg,isError) {
 
 // ===================== BOOT =====================
 checkSession();
+
+// ===================== JARVIS CHAT WIDGET =====================
+const JARVIS_API = 'https://myclaw.ai/v1/chat/completions';
+const JARVIS_TOKEN = '00814c53f0496287fe7798bf684e8516fa065ad865378c00f0ed3b2561419ef9';
+let jarvisChatOpen = false;
+let jarvisMessages = [];
+let jarvisStreaming = false;
+let jarvisSessionId = null;
+
+function getJarvisSessionId() {
+  if (jarvisSessionId) return jarvisSessionId;
+  let stored = localStorage.getItem('jarvis_session_id');
+  if (!stored) { stored = 'brain-' + crypto.randomUUID(); localStorage.setItem('jarvis_session_id', stored); }
+  jarvisSessionId = stored;
+  return stored;
+}
+
+function toggleJarvisChat() {
+  jarvisChatOpen = !jarvisChatOpen;
+  document.getElementById('jarvisChatPanel').classList.toggle('open', jarvisChatOpen);
+  document.getElementById('jarvisChatBtn').classList.toggle('hidden', jarvisChatOpen);
+  if (jarvisChatOpen) {
+    setTimeout(() => document.getElementById('jarvisInput').focus(), 300);
+    scrollJarvisToBottom();
+  }
+}
+
+function clearJarvisChat() {
+  jarvisMessages = [];
+  jarvisSessionId = null;
+  localStorage.removeItem('jarvis_session_id');
+  const container = document.getElementById('jarvisMessages');
+  container.innerHTML = '<div class="jarvis-msg jarvis-msg-ai"><div class="jarvis-msg-bubble">Fresh start. What do you need?</div></div>';
+}
+
+function addJarvisMessage(role, content) {
+  const container = document.getElementById('jarvisMessages');
+  const isUser = role === 'user';
+  const div = document.createElement('div');
+  div.className = `jarvis-msg ${isUser ? 'jarvis-msg-user' : 'jarvis-msg-ai'}`;
+  const bubble = document.createElement('div');
+  bubble.className = 'jarvis-msg-bubble';
+  bubble.textContent = content;
+  div.appendChild(bubble);
+  container.appendChild(div);
+  scrollJarvisToBottom();
+  return bubble;
+}
+
+function addJarvisTyping() {
+  const container = document.getElementById('jarvisMessages');
+  const div = document.createElement('div');
+  div.className = 'jarvis-msg jarvis-msg-typing';
+  div.id = 'jarvisTypingIndicator';
+  div.innerHTML = '<div class="jarvis-msg-bubble"><div class="jarvis-typing-dot"></div><div class="jarvis-typing-dot"></div><div class="jarvis-typing-dot"></div></div>';
+  container.appendChild(div);
+  scrollJarvisToBottom();
+}
+
+function removeJarvisTyping() {
+  const el = document.getElementById('jarvisTypingIndicator');
+  if (el) el.remove();
+}
+
+function scrollJarvisToBottom() {
+  const container = document.getElementById('jarvisMessages');
+  requestAnimationFrame(() => { container.scrollTop = container.scrollHeight; });
+}
+
+function autoResizeJarvisInput() {
+  const el = document.getElementById('jarvisInput');
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+function handleJarvisKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendJarvisMessage(); }
+}
+
+async function sendJarvisMessage() {
+  const input = document.getElementById('jarvisInput');
+  const text = input.value.trim();
+  if (!text || jarvisStreaming) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+  jarvisStreaming = true;
+  document.getElementById('jarvisSendBtn').disabled = true;
+
+  // Add user message
+  jarvisMessages.push({ role: 'user', content: text });
+  addJarvisMessage('user', text);
+
+  // Show typing
+  addJarvisTyping();
+
+  // Build messages array for API
+  const apiMessages = jarvisMessages.map(m => ({ role: m.role, content: m.content }));
+
+  try {
+    const response = await fetch(JARVIS_API, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${JARVIS_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'openclaw:main',
+        messages: apiMessages,
+        stream: true,
+        user: getJarvisSessionId()
+      })
+    });
+
+    if (!response.ok) {
+      removeJarvisTyping();
+      addJarvisMessage('assistant', 'Connection error. Try again.');
+      jarvisStreaming = false;
+      document.getElementById('jarvisSendBtn').disabled = false;
+      return;
+    }
+
+    // Remove typing indicator and create streaming bubble
+    removeJarvisTyping();
+    const bubble = addJarvisMessage('assistant', '');
+    let fullText = '';
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data: ')) continue;
+        const data = trimmed.slice(6);
+        if (data === '[DONE]') continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (delta) {
+            fullText += delta;
+            bubble.textContent = fullText;
+            scrollJarvisToBottom();
+          }
+        } catch (e) { /* skip malformed chunks */ }
+      }
+    }
+
+    // If we got no text from streaming, try non-streaming fallback
+    if (!fullText) {
+      try {
+        const fallback = await fetch(JARVIS_API, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${JARVIS_TOKEN}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: 'openclaw:main',
+            messages: apiMessages,
+            stream: false,
+            user: getJarvisSessionId()
+          })
+        });
+        const fbData = await fallback.json();
+        fullText = fbData.choices?.[0]?.message?.content || 'No response.';
+        bubble.textContent = fullText;
+      } catch (e) {
+        fullText = 'Connection error.';
+        bubble.textContent = fullText;
+      }
+    }
+
+    jarvisMessages.push({ role: 'assistant', content: fullText });
+
+  } catch (error) {
+    removeJarvisTyping();
+    addJarvisMessage('assistant', 'Connection failed. Try again in a moment.');
+  }
+
+  jarvisStreaming = false;
+  document.getElementById('jarvisSendBtn').disabled = false;
+  document.getElementById('jarvisInput').focus();
+}
