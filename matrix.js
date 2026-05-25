@@ -69,12 +69,8 @@ async function init() {
   dashboardInitialized = true;
   await loadMarkets();
   initMap(); initSearch(); initFilters();
-  if (allMarkets.length > 0) {
-    const active = allMarkets.find(m => m.is_active) || allMarkets[0];
-    currentMarketId = active.id;
-    document.getElementById('marketSelect').value = currentMarketId;
-    await loadMarketData();
-  }
+  // Load ALL markets at once
+  await loadMarketData();
 }
 
 async function loadMarkets() {
@@ -86,7 +82,7 @@ async function loadMarkets() {
 }
 
 function initMap() {
-  map = L.map('map', { center:[34.75,-92.45], zoom:12, zoomControl:true, preferCanvas:true });
+  map = L.map('map', { center:[34.75,-92.45], zoom:7, zoomControl:true, preferCanvas:true });
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom:19, attribution:'CARTO' }).addTo(map);
 }
 
@@ -104,20 +100,24 @@ function initFilters() {
 
 // ===================== DATA =====================
 async function loadMarketData() {
-  document.getElementById('subList').innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
-  const { data: subs } = await sb.from('subdivisions').select('*').eq('market_id', currentMarketId).order('name');
+  document.getElementById('subList').innerHTML = '<div class="loading"><div class="spinner"></div>Loading ALL Markets...</div>';
+  // Load ALL subdivisions from ALL markets
+  const { data: subs } = await sb.from('subdivisions').select('*').order('name');
   allSubdivisions = subs || [];
   allParcels = [];
   let from = 0, pageSize = 1000;
+  console.log('Loading all parcels from all markets...');
   while (true) {
     const { data: batch } = await sb.from('parcels')
       .select('id,pin,address,city,zip,owner_full_name,owner_first_name,owner_last_name,subdivision_id,status,off_market_willing,notes,phone,email,skiptraced,last_mailed_at,times_mailed,center_lat,center_lng,parcel_geojson,mail_history,tags')
-      .eq('market_id', currentMarketId).range(from, from + pageSize - 1);
+      .range(from, from + pageSize - 1);
     if (!batch || batch.length === 0) break;
     allParcels.push(...batch);
+    console.log(`Loaded ${allParcels.length} parcels...`);
     if (batch.length < pageSize) break;
     from += pageSize;
   }
+  console.log(`Total parcels loaded: ${allParcels.length}`);
   updateStats(); renderSubList(); renderMap();
 }
 
